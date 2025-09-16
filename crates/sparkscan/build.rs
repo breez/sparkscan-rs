@@ -6,6 +6,8 @@ cfg_if::cfg_if! {
     }
 }
 
+use quote::quote;
+
 use schemars::schema::{InstanceType, SchemaObject};
 
 /// Read documentation from a markdown file and convert it to doc attributes
@@ -119,6 +121,9 @@ fn main() {
 
     let mut doc_modifier = ClientDocumentationModifier::new();
     doc_modifier.visit_file_mut(&mut ast);
+
+    let mut api_version_remover = ApiVersionHeaderRemover::new();
+    api_version_remover.visit_file_mut(&mut ast);
 
     let mut untagged_i128_injector = UntaggedI128Injector;
     untagged_i128_injector.visit_file_mut(&mut ast);
@@ -633,6 +638,81 @@ impl syn::visit_mut::VisitMut for BuilderSendInstrumenter {
         }
 
         syn::visit_mut::visit_item_impl_mut(self, item);
+    }
+}
+
+struct ApiVersionHeaderRemover {
+    modified: bool,
+}
+
+impl ApiVersionHeaderRemover {
+    fn new() -> Self {
+        Self { modified: false }
+    }
+}
+
+impl syn::visit_mut::VisitMut for ApiVersionHeaderRemover {
+    fn visit_block_mut(&mut self, block: &mut syn::Block) {
+        // Look for patterns where api-version header is being set
+        let mut new_statements = Vec::new();
+        let mut skip_next = false;
+
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+
+            // Check if this statement contains api-version header setup
+            let stmt_str = quote::quote!(#stmt).to_string();
+
+            if stmt_str.contains("api-version") {
+                // Skip this statement and potentially the next one if it's related
+                if let Some(next_stmt) = block.stmts.get(i + 1) {
+                    let next_stmt_str = quote::quote!(#next_stmt).to_string();
+                    if next_stmt_str.contains("api_version")
+                        || next_stmt_str.contains("HeaderValue::from_static")
+                    {
+                        skip_next = true;
+                    }
+                }
+                self.modified = true;
+                continue;
+            }
+
+            new_statements.push(stmt.clone());
+        }
+
+        if self.modified {
+            block.stmts = new_statements;
+        }
+
+        // Continue visiting nested blocks
+        syn::visit_mut::visit_block_mut(self, block);
+    }
+
+    fn visit_expr_method_call_mut(&mut self, method_call: &mut syn::ExprMethodCall) {
+        // Look for header_map.append calls with api-version
+        if method_call.method == "append" {
+            if let Some(syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(lit_str),
+                ..
+            })) = method_call.args.first()
+            {
+                if lit_str.value() == "api-version" {
+                    // Replace this method call with a no-op or remove it
+                    // We'll replace it with a comment or empty block
+                    *method_call = parse_quote! {
+                        // api-version header removed
+                        header_map.len()
+                    };
+                    self.modified = true;
+                    return;
+                }
+            }
+        }
+
+        syn::visit_mut::visit_expr_method_call_mut(self, method_call);
     }
 }
 
